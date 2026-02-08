@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Redshift Query Cost Analyzer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" rel="stylesheet">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=DM+Sans:wght@400;500;600;700&display=swap');
+:root { --bg: #0f172a; --surface: #1e293b; --surface2: #334155; --border: #475569;
+  --accent: #38bdf8; --accent2: #818cf8; --green: #4ade80; --yellow: #fbbf24;
+  --red: #f87171; --text: #e2e8f0; --text2: #94a3b8; --text3: #64748b; }
+* { box-sizing: border-box; }
+body { margin:0; background: var(--bg); color: var(--text); font-family: 'DM Sans', sans-serif; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+textarea, input, select { background: var(--surface); border:1px solid var(--border);
+  color: var(--text); border-radius:8px; padding:10px 12px; font-size:14px; width:100%; }
+textarea:focus, input:focus, select:focus { outline:none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(56,189,248,0.2); }
+textarea { font-family: 'JetBrains Mono', monospace; font-size:13px; resize:vertical; min-height:120px; }
+button { cursor:pointer; border:none; border-radius:8px; font-family:'DM Sans',sans-serif; font-weight:600; transition: all 0.15s; }
+button:hover { transform: translateY(-1px); }
+.btn-primary { background: linear-gradient(135deg, #38bdf8, #818cf8); color:#fff; padding:10px 20px; font-size:14px; }
+.btn-secondary { background: var(--surface2); color: var(--text); padding:8px 16px; font-size:13px; border:1px solid var(--border); }
+.btn-danger { background: var(--red); color:#fff; padding:8px 16px; font-size:13px; }
+.btn-sm { padding:6px 12px; font-size:12px; }
+.card { background: var(--surface); border:1px solid var(--border); border-radius:12px; padding:24px; }
+.badge { display:inline-block; padding:3px 10px; border-radius:20px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.5px; }
+.badge-high { background: rgba(74,222,128,0.15); color: var(--green); }
+.badge-medium { background: rgba(251,191,36,0.15); color: var(--yellow); }
+.badge-low { background: rgba(248,113,113,0.15); color: var(--red); }
+.tab { padding:10px 20px; font-size:14px; font-weight:600; color: var(--text3); border-bottom:2px solid transparent; background:none; cursor:pointer; transition: all 0.2s; }
+.tab:hover { color: var(--text2); }
+.tab.active { color: var(--accent); border-color: var(--accent); }
+.fade-in { animation: fadeIn 0.3s ease; }
+@keyframes fadeIn { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+.grid-2 { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+.grid-3 { display:grid; grid-template-columns:1fr 1fr 1fr; gap:16px; }
+label { display:block; font-size:13px; color: var(--text2); margin-bottom:4px; font-weight:500; }
+.stat-value { font-size:28px; font-weight:700; line-height:1; }
+.stat-label { font-size:12px; color: var(--text3); margin-top:4px; text-transform:uppercase; letter-spacing:0.5px; }
+.plan-node { padding:8px 12px; border-left:3px solid var(--accent); margin:6px 0; background: rgba(56,189,248,0.05); border-radius:0 6px 6px 0; font-size:13px; }
+table.data { width:100%; border-collapse:collapse; font-size:13px; }
+table.data th { text-align:left; padding:10px 12px; background: var(--surface2); color: var(--text2); font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:0.5px; }
+table.data td { padding:10px 12px; border-bottom:1px solid var(--border); }
+.step-indicator { display:flex; gap:8px; margin-bottom:24px; }
+.step-dot { width:32px; height:32px; border-radius:50%; display:flex; align-items:center; justify-content:center;
+  font-size:13px; font-weight:700; background: var(--surface2); color: var(--text3); transition: all 0.3s; }
+.step-dot.active { background: var(--accent); color: #0f172a; }
+.step-dot.done { background: var(--green); color: #0f172a; }
+.scroll-x { overflow-x:auto; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback, useRef } = React;
+const API = window.location.origin + "/api";
+
+// ─── Utility Hooks ──────────────────────────────────────────────────
+function useApi(url, deps = []) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const load = useCallback(() => {
+    setLoading(true);
+    fetch(API + url).then(r => r.json()).then(d => { setData(d); setLoading(false); })
+      .catch(() => setLoading(false));
+  }, [url]);
+  useEffect(load, deps);
+  return { data, loading, reload: load };
+}
+
+async function post(url, body) {
+  const r = await fetch(API + url, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+  });
+  return r.json();
+}
+
+// ─── Components ─────────────────────────────────────────────────────
+function ConfidenceBadge({ level }) {
+  const cls = level === "high" ? "badge-high" : level === "medium" ? "badge-medium" : "badge-low";
+  const label = level === "high" ? "Alta" : level === "medium" ? "Media" : "Baja";
+  return <span className={`badge ${cls}`}>Confianza {label}</span>;
+}
+
+function StatCard({ value, label, color, sub }) {
+  return (
+    <div className="card" style={{ textAlign:"center" }}>
+      <div className="stat-value" style={{ color: color || "var(--accent)" }}>{value}</div>
+      <div className="stat-label">{label}</div>
+      {sub && <div style={{ fontSize:12, color:"var(--text3)", marginTop:4 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function ClusterConfigPanel({ config, onChange }) {
+  const { data: pricing } = useApi("/pricing");
+  if (!pricing) return null;
+  const nodes = Object.keys(pricing.node_types);
+  const reservedOpts = Object.keys(pricing.reserved_discounts);
+
+  const set = (k, v) => onChange({ ...config, [k]: v });
+
+  return (
+    <div className="card" style={{ marginBottom:16 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+        <h3 style={{ margin:0, fontSize:16, fontWeight:600 }}>⚙️ Configuración del Cluster</h3>
+        <ConfidenceBadge level={config._confidence || "low"} />
+      </div>
+      <div className="grid-3" style={{ gap:12 }}>
+        <div>
+          <label>Billing Model</label>
+          <select value={config.billing_model} onChange={e => set("billing_model", e.target.value)}>
+            <option value="provisioned">Provisioned</option>
+            <option value="serverless">Serverless</option>
+          </select>
+        </div>
+        {config.billing_model === "provisioned" ? <>
+          <div>
+            <label>Tipo de Nodo</label>
+            <select value={config.node_type} onChange={e => set("node_type", e.target.value)}>
+              {nodes.map(n => <option key={n} value={n}>{n} (${pricing.node_types[n]}/hr)</option>)}
+            </select>
+          </div>
+          <div>
+            <label>Nodos</label>
+            <input type="number" min="1" max="128" value={config.num_nodes} onChange={e => set("num_nodes", parseInt(e.target.value) || 1)} />
+          </div>
+          <div>
+            <label>Reserved Instance</label>
+            <select value={config.reserved_type} onChange={e => set("reserved_type", e.target.value)}>
+              {reservedOpts.map(r => <option key={r} value={r}>{r.replace(/_/g, " ")} ({(pricing.reserved_discounts[r]*100).toFixed(0)}% off)</option>)}
+            </select>
+          </div>
+          <div>
+            <label>Concurrencia Promedio</label>
+            <input type="number" min="1" max="50" value={config.avg_concurrency} onChange={e => set("avg_concurrency", parseInt(e.target.value) || 1)} />
+          </div>
+        </> : <>
+          <div>
+            <label>Base RPU</label>
+            <input type="number" min="8" max="512" step="8" value={config.serverless_base_rpu} onChange={e => set("serverless_base_rpu", parseInt(e.target.value) || 8)} />
+          </div>
+        </>}
+        <div>
+          <label>Ejecuciones / Día</label>
+          <input type="number" min="1" value={config.executions_per_day || 1} onChange={e => set("executions_per_day", parseInt(e.target.value) || 1)} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ANALYZER TAB ───────────────────────────────────────────────────
+function AnalyzerTab({ config }) {
+  const [explain, setExplain] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const analyze = async () => {
+    if (!explain.trim()) return;
+    setLoading(true);
+    const res = await post("/analyze", {
+      explain_text: explain, ...config,
+      executions_per_day: config.executions_per_day || 1,
+    });
+    setResult(res);
+    setLoading(false);
+  };
+
+  const est = result?.estimate;
+  const plan = result?.plan;
+
+  return (
+    <div className="fade-in">
+      <div className="card" style={{ marginBottom:16 }}>
+        <h3 style={{ margin:"0 0 12px", fontSize:16 }}>📋 Pegar EXPLAIN Plan</h3>
+        <textarea
+          value={explain} onChange={e => setExplain(e.target.value)}
+          placeholder={"XN Hash Join DS_BCAST_INNER  (cost=175734.03..1652544172278.50 rows=6938483 width=179)\n  Hash Cond: (\"outer\".id = \"inner\".id)\n  ->  XN Seq Scan on orders  (cost=0.00..69384.83 rows=6938483 width=108)\n  ->  XN Hash  (cost=1757.34..1757.34 rows=175734 width=71)\n        ->  XN Seq Scan on customers  (cost=0.00..1757.34 rows=175734 width=71)"}
+          rows={8}
+        />
+        <div style={{ marginTop:12, display:"flex", gap:8, alignItems:"center" }}>
+          <button className="btn-primary" onClick={analyze} disabled={loading}>
+            {loading ? "Analizando..." : "🔍 Analizar Costo"}
+          </button>
+          {est && <ConfidenceBadge level={est.confidence} />}
+        </div>
+      </div>
+
+      {est && (
+        <div className="fade-in">
+          {/* Results Grid */}
+          <div className="grid-3" style={{ marginBottom:16 }}>
+            <StatCard value={est.formatted_time} label="Tiempo Estimado" color="var(--accent)" />
+            <StatCard value={est.formatted_cost} label="Costo por Ejecución" color="var(--green)"
+              sub={`Compute: ${est.formatted_compute}`} />
+            <StatCard value={`$${est.monthly_cost.toFixed(2)}`} label="Costo Mensual"
+              color="var(--yellow)" sub={`${config.executions_per_day || 1}x/día × 30 días`} />
+          </div>
+
+          <div className="grid-2" style={{ marginBottom:16 }}>
+            {/* Plan Analysis */}
+            <div className="card">
+              <h4 style={{ margin:"0 0 12px", fontSize:14, color:"var(--text2)" }}>📊 Análisis del Plan</h4>
+              <table className="data">
+                <tbody>
+                  <tr><td style={{color:"var(--text3)"}}>Operación Principal</td><td className="mono">{est.primary_operation || "—"}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Distribución</td><td className="mono">{est.primary_distribution || "N/A"}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Complejidad</td><td>{est.complexity_score.toFixed(2)}x</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Paralelización</td><td>{(est.parallelization_efficiency * 100).toFixed(0)}%</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Data Escaneada</td><td>{est.data_scanned_gb.toFixed(2)} GB</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Nodos del Plan</td><td>{est.num_plan_nodes}</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            {/* Projections */}
+            <div className="card">
+              <h4 style={{ margin:"0 0 12px", fontSize:14, color:"var(--text2)" }}>💰 Proyecciones</h4>
+              <table className="data">
+                <tbody>
+                  <tr><td style={{color:"var(--text3)"}}>Por Ejecución</td><td style={{fontWeight:600}}>{est.formatted_cost}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Diario ({config.executions_per_day || 1}x)</td><td>${est.daily_cost.toFixed(4)}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Mensual</td><td style={{fontWeight:600, color:"var(--yellow)"}}>${est.monthly_cost.toFixed(2)}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Anual</td><td style={{fontWeight:600, color:"var(--red)"}}>${est.yearly_cost.toFixed(2)}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>Modelo</td><td>{est.model_type === "calibrated" ? `Calibrado (R²=${est.model_r_squared.toFixed(2)})` : "Default"}</td></tr>
+                </tbody>
+              </table>
+              <div style={{ marginTop:12, padding:10, background:"rgba(56,189,248,0.08)", borderRadius:8, fontSize:12, color:"var(--text2)" }}>
+                {est.confidence_detail}
+              </div>
+            </div>
+          </div>
+
+          {/* Plan Tree */}
+          {plan && plan.nodes && plan.nodes.length > 0 && (
+            <div className="card">
+              <h4 style={{ margin:"0 0 12px", fontSize:14, color:"var(--text2)" }}>🌲 Árbol del Plan</h4>
+              {plan.nodes.map((node, i) => (
+                <div key={i} className="plan-node" style={{ marginLeft: node.depth * 24,
+                  borderLeftColor: node.distribution ? "var(--yellow)" : "var(--accent)" }}>
+                  <span style={{ fontWeight:600 }}>{node.operation}</span>
+                  {node.table_name && <span className="mono" style={{ color:"var(--accent)", marginLeft:8 }}>{node.table_name}</span>}
+                  {node.distribution && <span className="badge badge-medium" style={{ marginLeft:8 }}>{node.distribution}</span>}
+                  <span className="mono" style={{ color:"var(--text3)", marginLeft:8, fontSize:12 }}>
+                    cost={node.total_cost.toLocaleString()} rows={node.rows.toLocaleString()} w={node.width}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── CALIBRATION TAB ────────────────────────────────────────────────
+function CalibrationTab({ config }) {
+  const [step, setStep] = useState(1);
+  const [points, setPoints] = useState([]);
+  const [model, setModel] = useState(null);
+  const [form, setForm] = useState({ explain_text: "", actual_time_seconds: "", query_label: "" });
+  const [adding, setAdding] = useState(false);
+  const [fitting, setFitting] = useState(false);
+
+  const loadData = async () => {
+    const [pRes, mRes] = await Promise.all([
+      fetch(API + "/calibration/points").then(r => r.json()),
+      fetch(API + "/calibration/model").then(r => r.json()),
+    ]);
+    setPoints(pRes.points || []);
+    setModel(mRes);
+  };
+  useEffect(() => { loadData(); }, []);
+
+  const addPoint = async () => {
+    if (!form.explain_text.trim() || !form.actual_time_seconds) return;
+    setAdding(true);
+    await post("/calibration/add-from-explain", {
+      explain_text: form.explain_text,
+      actual_time_seconds: parseFloat(form.actual_time_seconds),
+      query_label: form.query_label,
+      num_nodes: config.num_nodes,
+      node_type: config.node_type,
+    });
+    setForm({ explain_text: "", actual_time_seconds: "", query_label: "" });
+    await loadData();
+    setAdding(false);
+  };
+
+  const fitModel = async () => {
+    setFitting(true);
+    const res = await post("/calibration/fit", {});
+    setModel({ model: res.model, confidence: res.confidence, is_default: false });
+    setFitting(false);
+    setStep(3);
+  };
+
+  const clearAll = async () => {
+    if (!confirm("¿Borrar todos los datos de calibración?")) return;
+    await post("/calibration/clear", {});
+    await loadData();
+    setStep(1);
+  };
+
+  const confidence = model?.confidence || "low";
+
+  return (
+    <div className="fade-in">
+      {/* Step Indicator */}
+      <div className="step-indicator">
+        {[1,2,3].map(s => (
+          <React.Fragment key={s}>
+            <div className={`step-dot ${step === s ? "active" : s < step || points.length >= s * 2 ? "done" : ""}`}
+              onClick={() => setStep(s)} style={{ cursor:"pointer" }}>{s}</div>
+            {s < 3 && <div style={{ flex:1, height:2, background:"var(--border)", alignSelf:"center" }} />}
+          </React.Fragment>
+        ))}
+        <div style={{ marginLeft:16, fontSize:13, color:"var(--text2)", alignSelf:"center" }}>
+          {step === 1 && "Agregar datos de benchmark"}
+          {step === 2 && "Entrenar modelo"}
+          {step === 3 && "Resultado"}
+        </div>
+      </div>
+
+      {step === 1 && (
+        <div className="grid-2">
+          <div className="card">
+            <h3 style={{ margin:"0 0 16px", fontSize:16 }}>➕ Agregar Punto de Calibración</h3>
+            <p style={{ fontSize:13, color:"var(--text3)", margin:"0 0 16px" }}>
+              Ejecutá una query en tu cluster, anotá el tiempo real, y pegá el EXPLAIN aquí.
+            </p>
+            <div style={{ marginBottom:12 }}>
+              <label>Etiqueta (opcional)</label>
+              <input value={form.query_label} onChange={e => setForm({...form, query_label: e.target.value})}
+                placeholder="Ej: Join de ventas x productos" />
+            </div>
+            <div style={{ marginBottom:12 }}>
+              <label>EXPLAIN Plan *</label>
+              <textarea value={form.explain_text} onChange={e => setForm({...form, explain_text: e.target.value})}
+                placeholder="XN Seq Scan on orders (cost=0.00..69384.83 rows=6938483 width=108)" rows={5} />
+            </div>
+            <div style={{ marginBottom:16 }}>
+              <label>Tiempo Real de Ejecución (segundos) *</label>
+              <input type="number" step="0.01" min="0" value={form.actual_time_seconds}
+                onChange={e => setForm({...form, actual_time_seconds: e.target.value})}
+                placeholder="Ej: 4.32" />
+            </div>
+            <button className="btn-primary" onClick={addPoint} disabled={adding}>
+              {adding ? "Guardando..." : "💾 Guardar Punto"}
+            </button>
+          </div>
+
+          <div className="card">
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+              <h3 style={{ margin:0, fontSize:16 }}>📊 Puntos ({points.length})</h3>
+              {points.length >= 3 && (
+                <button className="btn-primary btn-sm" onClick={() => setStep(2)}>
+                  Siguiente → Entrenar
+                </button>
+              )}
+            </div>
+            {points.length === 0 ? (
+              <p style={{ color:"var(--text3)", fontSize:13 }}>
+                Necesitás al menos 3 puntos. Idealmente 5-10 con diferentes tipos de queries.
+              </p>
+            ) : (
+              <div className="scroll-x">
+                <table className="data">
+                  <thead><tr>
+                    <th>Etiqueta</th><th>Operación</th><th>Cost</th><th>Tiempo Real</th>
+                  </tr></thead>
+                  <tbody>
+                    {points.map((p, i) => (
+                      <tr key={i}>
+                        <td>{p.query_label || `#${i+1}`}</td>
+                        <td className="mono" style={{fontSize:12}}>{p.operation_type}</td>
+                        <td className="mono" style={{fontSize:12}}>{p.explain_cost.toLocaleString()}</td>
+                        <td className="mono">{p.actual_time_seconds.toFixed(2)}s</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div style={{ marginTop:16, padding:10, background:"rgba(56,189,248,0.08)", borderRadius:8 }}>
+              <div style={{ fontSize:12, color:"var(--text2)" }}>
+                💡 <strong>Tips para buena calibración:</strong><br/>
+                • Incluí queries con Seq Scan, Hash Join, Sort<br/>
+                • Variá el tamaño (queries chicas y grandes)<br/>
+                • Usá queries representativas de tu workload
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {step === 2 && (
+        <div className="card" style={{ textAlign:"center", maxWidth:500, margin:"0 auto" }}>
+          <h3 style={{ margin:"0 0 16px" }}>🧠 Entrenar Modelo de Regresión</h3>
+          <p style={{ color:"var(--text2)", fontSize:14, marginBottom:24 }}>
+            Se van a usar <strong>{points.length} puntos</strong> para ajustar el modelo:<br/>
+            <span className="mono" style={{ fontSize:12, color:"var(--text3)" }}>
+              log(time) = α·log(cost) + β·log(rows) + γ·width + δ[op] + ε[dist] + intercept
+            </span>
+          </p>
+          <button className="btn-primary" onClick={fitModel} disabled={fitting}
+            style={{ fontSize:16, padding:"14px 40px" }}>
+            {fitting ? "Entrenando..." : "🚀 Entrenar Modelo"}
+          </button>
+        </div>
+      )}
+
+      {step === 3 && model && model.model && (
+        <div className="fade-in">
+          <div className="grid-3" style={{ marginBottom:16 }}>
+            <StatCard value={`${model.model.r_squared?.toFixed(3) || "—"}`} label="R²"
+              color={model.model.r_squared > 0.7 ? "var(--green)" : model.model.r_squared > 0.4 ? "var(--yellow)" : "var(--red)"} />
+            <StatCard value={model.model.num_points} label="Puntos" color="var(--accent)" />
+            <StatCard value={model.confidence?.toUpperCase() || "—"} label="Confianza"
+              color={confidence === "high" ? "var(--green)" : confidence === "medium" ? "var(--yellow)" : "var(--red)"} />
+          </div>
+          <div className="grid-2">
+            <div className="card">
+              <h4 style={{ margin:"0 0 12px", fontSize:14, color:"var(--text2)" }}>Coeficientes del Modelo</h4>
+              <table className="data">
+                <tbody>
+                  <tr><td style={{color:"var(--text3)"}}>α (log cost)</td><td className="mono">{model.model.alpha?.toFixed(4)}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>β (log rows)</td><td className="mono">{model.model.beta?.toFixed(4)}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>γ (width)</td><td className="mono">{model.model.gamma?.toFixed(6)}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>intercept</td><td className="mono">{model.model.intercept?.toFixed(4)}</td></tr>
+                  <tr><td style={{color:"var(--text3)"}}>MAE</td><td className="mono">{model.model.mean_absolute_error?.toFixed(3)}s</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div className="card">
+              <h4 style={{ margin:"0 0 12px", fontSize:14, color:"var(--text2)" }}>Offsets por Operación</h4>
+              <table className="data">
+                <tbody>
+                  {model.model.operation_offsets && Object.entries(model.model.operation_offsets).map(([op, v]) => (
+                    <tr key={op}><td className="mono" style={{fontSize:12}}>{op}</td>
+                      <td className="mono" style={{color: v > 0 ? "var(--red)" : "var(--green)"}}>{v > 0 ? "+" : ""}{v.toFixed(3)}</td></tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div style={{ marginTop:16, textAlign:"center" }}>
+            <button className="btn-secondary" onClick={() => setStep(1)} style={{marginRight:8}}>
+              ← Agregar más puntos
+            </button>
+            <button className="btn-danger btn-sm" onClick={clearAll}>🗑 Resetear Calibración</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── COMPARE TAB ────────────────────────────────────────────────────
+function CompareTab({ config }) {
+  const [queries, setQueries] = useState(["", ""]);
+  const [results, setResults] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const addQuery = () => setQueries([...queries, ""]);
+  const removeQuery = (i) => setQueries(queries.filter((_, idx) => idx !== i));
+  const updateQuery = (i, v) => { const q = [...queries]; q[i] = v; setQueries(q); };
+
+  const compare = async () => {
+    const valid = queries.filter(q => q.trim());
+    if (valid.length < 2) return;
+    setLoading(true);
+    const res = await post("/compare", { queries: valid, ...config });
+    setResults(res.comparisons);
+    setLoading(false);
+  };
+
+  return (
+    <div className="fade-in">
+      <div className="card" style={{ marginBottom:16 }}>
+        <h3 style={{ margin:"0 0 16px", fontSize:16 }}>⚖️ Comparar Queries</h3>
+        {queries.map((q, i) => (
+          <div key={i} style={{ marginBottom:12 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:4 }}>
+              <label>Query {i + 1}</label>
+              {queries.length > 2 && (
+                <button className="btn-danger btn-sm" onClick={() => removeQuery(i)}>✕</button>
+              )}
+            </div>
+            <textarea value={q} onChange={e => updateQuery(i, e.target.value)}
+              placeholder={`Pegar EXPLAIN de Query ${i + 1}...`} rows={4} />
+          </div>
+        ))}
+        <div style={{ display:"flex", gap:8 }}>
+          <button className="btn-secondary" onClick={addQuery}>+ Agregar Query</button>
+          <button className="btn-primary" onClick={compare} disabled={loading}>
+            {loading ? "Comparando..." : "🔍 Comparar"}
+          </button>
+        </div>
+      </div>
+
+      {results && (
+        <div className="fade-in card">
+          <h3 style={{ margin:"0 0 16px", fontSize:16 }}>📊 Ranking de Costos</h3>
+          <table className="data">
+            <thead><tr>
+              <th>#</th><th>Query</th><th>Operación</th><th>Tiempo Est.</th><th>Costo</th><th>Costo Relativo</th>
+            </tr></thead>
+            <tbody>
+              {results.map((r, i) => (
+                <tr key={i}>
+                  <td><span style={{ fontWeight:700, color: i === 0 ? "var(--red)" : i === results.length-1 ? "var(--green)" : "var(--text)" }}>
+                    #{r.rank}
+                  </span></td>
+                  <td>{r.query_label}</td>
+                  <td className="mono" style={{fontSize:12}}>{r.estimate.primary_operation}</td>
+                  <td className="mono">{r.estimate.formatted_time}</td>
+                  <td className="mono" style={{fontWeight:600}}>{r.estimate.formatted_cost}</td>
+                  <td>
+                    <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+                      <div style={{ flex:1, height:8, background:"var(--surface2)", borderRadius:4, overflow:"hidden" }}>
+                        <div style={{ width:`${(r.relative_cost * 100)}%`, height:"100%",
+                          background: i === 0 ? "var(--red)" : "var(--accent)", borderRadius:4 }} />
+                      </div>
+                      <span className="mono" style={{fontSize:12, minWidth:40}}>{(r.relative_cost * 100).toFixed(0)}%</span>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── HISTORY TAB ────────────────────────────────────────────────────
+function HistoryTab() {
+  const { data, loading, reload } = useApi("/history?limit=30");
+  if (loading) return <p style={{color:"var(--text3)"}}>Cargando...</p>;
+  const history = data?.history || [];
+  if (!history.length) return <div className="card"><p style={{color:"var(--text3)"}}>Sin historial aún.</p></div>;
+
+  return (
+    <div className="fade-in card">
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+        <h3 style={{ margin:0, fontSize:16 }}>📜 Historial de Estimaciones</h3>
+        <button className="btn-secondary btn-sm" onClick={reload}>↻ Refresh</button>
+      </div>
+      <div className="scroll-x">
+        <table className="data">
+          <thead><tr>
+            <th>Fecha</th><th>Tiempo Est.</th><th>Costo</th><th>Confianza</th><th>EXPLAIN (preview)</th>
+          </tr></thead>
+          <tbody>
+            {history.map((h, i) => (
+              <tr key={i}>
+                <td style={{fontSize:12, whiteSpace:"nowrap"}}>{new Date(h.created_at).toLocaleString()}</td>
+                <td className="mono">{h.estimated_time?.toFixed(2)}s</td>
+                <td className="mono" style={{fontWeight:600}}>${h.estimated_cost?.toFixed(6)}</td>
+                <td><ConfidenceBadge level={h.confidence || "low"} /></td>
+                <td className="mono" style={{fontSize:11, maxWidth:300, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap"}}>
+                  {h.explain_input?.substring(0, 80)}...
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ───────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab] = useState("analyzer");
+  const [config, setConfig] = useState({
+    node_type: "ra3.4xlarge", num_nodes: 2, reserved_type: "none",
+    avg_concurrency: 5, billing_model: "provisioned", serverless_base_rpu: 8,
+    executions_per_day: 1, _confidence: "low",
+  });
+
+  // Load current model confidence
+  useEffect(() => {
+    fetch(API + "/calibration/model").then(r => r.json()).then(d => {
+      setConfig(c => ({ ...c, _confidence: d.confidence || "low" }));
+    }).catch(() => {});
+  }, [tab]);
+
+  return (
+    <div style={{ maxWidth:1100, margin:"0 auto", padding:"24px 16px" }}>
+      {/* Header */}
+      <div style={{ marginBottom:24 }}>
+        <h1 style={{ margin:0, fontSize:28, fontWeight:700, letterSpacing:"-0.5px" }}>
+          <span style={{ color:"var(--accent)" }}>⚡</span> Redshift Query Cost Analyzer
+        </h1>
+        <p style={{ margin:"4px 0 0", color:"var(--text3)", fontSize:14 }}>
+          Estimación pre-ejecución de costos monetarios desde EXPLAIN plan
+        </p>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display:"flex", borderBottom:"1px solid var(--border)", marginBottom:20 }}>
+        {[
+          ["analyzer", "🔍 Analizar"],
+          ["calibration", "🎯 Calibración"],
+          ["compare", "⚖️ Comparar"],
+          ["history", "📜 Historial"],
+        ].map(([id, label]) => (
+          <button key={id} className={`tab ${tab === id ? "active" : ""}`} onClick={() => setTab(id)}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* Cluster Config (not on history) */}
+      {tab !== "history" && <ClusterConfigPanel config={config} onChange={setConfig} />}
+
+      {/* Tab Content */}
+      {tab === "analyzer" && <AnalyzerTab config={config} />}
+      {tab === "calibration" && <CalibrationTab config={config} />}
+      {tab === "compare" && <CompareTab config={config} />}
+      {tab === "history" && <HistoryTab />}
+    </div>
+  );
+}
+
+ReactDOM.render(<App />, document.getElementById("root"));
+</script>
+</body>
+</html>
